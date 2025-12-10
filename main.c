@@ -68,8 +68,10 @@ void eval(Token *tokens,int *tokensc) {
   Token *mostbptoken = NULL;
   int mostbp = 0;
   for (int i = 0; i < *tokensc; i++)
-    if (tokens[i].type == OPERATOR && tokens[i].val.op.bp > mostbp)
+    if (tokens[i].type == OPERATOR && tokens[i].val.op.bp > mostbp) {
       mostbptoken = tokens+i;
+      mostbp = tokens[i].val.op.bp;
+    }
   
   if (mostbptoken == NULL) {
     fprintf(stderr,"Unable to find the most bp token.\n");

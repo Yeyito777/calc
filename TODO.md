@@ -1,1 +1,1 @@
-- [ ] Fix the bug that parenthization doesn't work e.g. (2 + 3) * 3 outputs: 11
+- [x] Fix the bug that parenthization doesn't work e.g. (2 + 3) * 3 outputs: 11
