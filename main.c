@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <float.h>
 #include <math.h>
 #include <setjmp.h>
 #include <stdarg.h>
@@ -9,6 +10,74 @@
 static const char *src, *p;
 static jmp_buf fail;
 static int depth;
+
+/* A value with a bound on its accumulated rounding error (e) and the largest
+   magnitude seen while computing it (m). A result within its own error of
+   zero is zero: sin(pi) = 0, 1-0.9-0.1 = 0. */
+typedef struct { double v, e, m; } Val;
+
+static double scaled(double c, double e) { return e == 0 ? 0 : fabs(c) * e; }
+
+static Val mk(double v, double e, double m) {
+  e += fabs(v) * DBL_EPSILON;
+  m = fmax(m, fabs(v));
+  if (isfinite(e) && fabs(v) <= 8 * e && e <= 1e-9 * m) v = 0;
+  return (Val){v, e, m};
+}
+
+static Val lit(double v, int exact) { return (Val){v, exact ? 0 : fabs(v) * DBL_EPSILON, fabs(v)}; }
+
+static Val add(Val a, Val b) { return mk(a.v + b.v, a.e + b.e, fmax(a.m, b.m)); }
+static Val neg(Val a) { a.v = -a.v; return a; }
+static Val mul(Val a, Val b) {
+  return mk(a.v * b.v, scaled(a.v, b.e) + scaled(b.v, a.e) + a.e * b.e, fmax(a.m, b.m));
+}
+static Val dvd(Val a, Val b) {
+  double r = a.v / b.v;
+  return mk(r, (a.e + scaled(r, b.e)) / fabs(b.v), fmax(a.m, b.m));
+}
+static Val mod(Val a, Val b) {
+  return mk(fmod(a.v, b.v), a.e + scaled(trunc(a.v / b.v), b.e), fmax(a.m, b.m));
+}
+static Val pw(Val a, Val b) {
+  double r = pow(a.v, b.v);
+  double e = scaled(b.v * pow(a.v, b.v - 1), a.e) + scaled(r * log(fabs(a.v)), b.e);
+  return mk(r, e, fmax(a.m, b.m));
+}
+static Val recip(Val a) { return (Val){1 / a.v, scaled(1 / (a.v * a.v), a.e), a.m}; }
+
+/* Error through f is estimated from its slope around x. */
+static Val apply(double (*f)(double), int smooth, Val x) {
+  double r = f(x.v), slope = 0;
+  if (smooth && x.e > 0) {
+    double h = fmax(x.e, fabs(x.v) * DBL_EPSILON);
+    slope = fabs(f(x.v + h) - f(x.v - h)) / (2 * h);
+  }
+  return mk(r, scaled(slope, x.e), slope);
+}
+
+static double fact(double x) { return tgamma(x + 1); }
+
+/* Whether the literal s..end is a whole number that v holds exactly (1e22 is, 1e23 isn't). */
+static int exact(const char *s, const char *end, double v) {
+  if (v != floor(v) || !isfinite(v)) return 0;
+  if (v < 0x1p53) return 1;
+  if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) return 0;
+  char want[400], got[400];
+  int n = 0, shift = 0, seen = 0;
+  for (; s < end && *s != 'e' && *s != 'E'; s++) {
+    if (*s == '.') { seen = 1; continue; }
+    if (n || *s != '0') { if (n >= 380) return 0; want[n++] = *s; }
+    if (seen) shift--;
+  }
+  if (s < end) shift += atoi(s + 1);
+  while (shift < 0 && n && want[n - 1] == '0') n--, shift++;
+  if (shift < 0 || n + shift >= 400) return 0;
+  while (shift-- > 0) want[n++] = '0';
+  want[n] = 0;
+  snprintf(got, sizeof got, "%.0f", v);
+  return !strcmp(want, got);
+}
 
 static void die(const char *fmt, ...) {
   va_list ap;
@@ -28,18 +97,18 @@ static void unexpected(void) {
 static void skip(void) { while (isspace((unsigned char)*p)) p++; }
 static int eat(char c) { skip(); if (*p == c) { p++; return 1; } return 0; }
 
-static const struct { const char *name; double (*fn)(double); } funcs[] = {
-  {"sqrt", sqrt}, {"cbrt", cbrt}, {"abs", fabs}, {"exp", exp},
-  {"ln", log}, {"log", log10}, {"log2", log2},
-  {"sin", sin}, {"cos", cos}, {"tan", tan},
-  {"asin", asin}, {"acos", acos}, {"atan", atan},
-  {"sinh", sinh}, {"cosh", cosh}, {"tanh", tanh},
-  {"floor", floor}, {"ceil", ceil}, {"round", round},
+static const struct { const char *name; double (*fn)(double); int smooth; } funcs[] = {
+  {"sqrt", sqrt, 1}, {"cbrt", cbrt, 1}, {"abs", fabs, 1}, {"exp", exp, 1},
+  {"ln", log, 1}, {"log", log10, 1}, {"log2", log2, 1},
+  {"sin", sin, 1}, {"cos", cos, 1}, {"tan", tan, 1},
+  {"asin", asin, 1}, {"acos", acos, 1}, {"atan", atan, 1},
+  {"sinh", sinh, 1}, {"cosh", cosh, 1}, {"tanh", tanh, 1},
+  {"floor", floor, 0}, {"ceil", ceil, 0}, {"round", round, 0},
 };
 
-static double expr(void);
+static Val expr(void);
 
-static double primary(void) {
+static Val primary(void) {
   skip();
   const char *start = p;
   char c = *p;
@@ -47,7 +116,7 @@ static double primary(void) {
     char close = c == '(' ? ')' : c == '[' ? ']' : '}';
     if (++depth > 1000) die("too deeply nested");
     p++;
-    double v = expr();
+    Val v = expr();
     if (!eat(close)) unexpected();
     depth--;
     return v;
@@ -56,72 +125,73 @@ static double primary(void) {
     char *end;
     double v = strtod(p, &end);
     if (end == p) unexpected();
+    Val r = lit(v, exact(p, end, v));
     p = end;
-    return v;
+    return r;
   }
   if (isalpha((unsigned char)c)) {
     while (isalnum((unsigned char)*p)) p++;
     size_t n = p - start;
-    if (n == 2 && !strncmp(start, "pi", 2)) return M_PI;
-    if (n == 1 && *start == 'e') return M_E;
+    if (n == 2 && !strncmp(start, "pi", 2)) return lit(M_PI, 0);
+    if (n == 1 && *start == 'e') return lit(M_E, 0);
     for (size_t i = 0; i < sizeof funcs / sizeof *funcs; i++)
       if (strlen(funcs[i].name) == n && !strncmp(start, funcs[i].name, n))
-        return funcs[i].fn(primary());
+        return apply(funcs[i].fn, funcs[i].smooth, primary());
     p = start;
     die("unknown name '%.*s' at %ld", (int)n, start, (long)(start - src) + 1);
   }
   unexpected();
-  return 0;
+  return lit(0, 1);
 }
 
-static double postfix(void) {
-  double v = primary();
-  while (eat('!')) v = tgamma(v + 1);
+static Val postfix(void) {
+  Val v = primary();
+  while (eat('!')) v = apply(fact, 1, v);
   return v;
 }
 
-static double unary(void);
+static Val unary(void);
 
 /* Right-associative: 2^3^2 = 2^9. Exponent may be signed: 2^-1. */
-static double power(void) {
-  double b = postfix();
+static Val power(void) {
+  Val b = postfix();
   skip();
   if (*p == '^' || (p[0] == '*' && p[1] == '*')) {
     p += *p == '^' ? 1 : 2;
-    return pow(b, unary());
+    return pw(b, unary());
   }
   if (*p == 'r' && !isalpha((unsigned char)p[1])) { /* 27r3 = cube root of 27 */
     p++;
-    return pow(b, 1 / unary());
+    return pw(b, recip(unary()));
   }
   return b;
 }
 
 /* -2^2 = -4, as in written math. */
-static double unary(void) {
-  if (eat('-')) return -unary();
+static Val unary(void) {
+  if (eat('-')) return neg(unary());
   if (eat('+')) return unary();
   return power();
 }
 
-static double term(void) {
-  double v = unary();
+static Val term(void) {
+  Val v = unary();
   for (;;) {
     skip();
-    if (eat('*')) v *= unary();
-    else if (eat('/')) v /= unary();
-    else if (eat('%')) v = fmod(v, unary());
+    if (eat('*')) v = mul(v, unary());
+    else if (eat('/')) v = dvd(v, unary());
+    else if (eat('%')) v = mod(v, unary());
     else if (*p == '(' || *p == '[' || *p == '{' || isalpha((unsigned char)*p))
-      v *= power(); /* 2pi, 3(4+1) */
+      v = mul(v, power()); /* 2pi, 3(4+1) */
     else return v;
   }
 }
 
-static double expr(void) {
-  double v = term();
+static Val expr(void) {
+  Val v = term();
   for (;;) {
-    if (eat('+')) v += term();
-    else if (eat('-')) v -= term();
+    if (eat('+')) v = add(v, term());
+    else if (eat('-')) v = add(v, neg(term()));
     else return v;
   }
 }
@@ -130,7 +200,7 @@ static int run(const char *s) {
   src = p = s;
   depth = 0;
   if (setjmp(fail)) return 1;
-  double v = expr();
+  double v = expr().v;
   skip();
   if (*p) unexpected();
   if (v == 0) v = 0; /* no -0 */
